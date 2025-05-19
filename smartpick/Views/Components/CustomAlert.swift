@@ -5,6 +5,14 @@ struct AlertType: Identifiable {
     let title: String
     let message: String
     let type: AlertStyle
+    var autoDisappear: Bool = false
+    
+    init(title: String, message: String, type: AlertStyle, autoDisappear: Bool? = nil) {
+        self.title = title
+        self.message = message
+        self.type = type
+        self.autoDisappear = autoDisappear ?? (type == .success)
+    }
 }
 
 enum AlertStyle {
@@ -79,6 +87,17 @@ struct CustomAlert: ViewModifier {
                     )
                     .padding()
                     .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .onAppear {
+                        if alert.autoDisappear {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                                withAnimation {
+                                    if self.alert?.id == alert.id {
+                                        self.alert = nil
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 .zIndex(1)
             }

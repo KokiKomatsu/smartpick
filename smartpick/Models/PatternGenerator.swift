@@ -7,6 +7,11 @@ actor PatternGenerator {
     private var requestedPatternCount: Int
     private var random = CustomRandomGenerator()
     
+    // 並列化用: 生成済みパターンのスレッドセーフ管理
+    private let patternStore = PatternStore()
+    // CPUコア数に応じてタスク数を最適化
+    private let cpuCount = max(ProcessInfo.processInfo.activeProcessorCount, 2)
+    
     // ビット操作のための定数
     private let lowRangeMask: UInt64 = (1 << 21) - 1  // 1-21の数字用ビットマスク
     private let over40Mask: UInt64 = (UInt64(1) << 40 | UInt64(1) << 41 | UInt64(1) << 42 | UInt64(1) << 43)  // 40-43用ビットマスク
@@ -19,25 +24,139 @@ actor PatternGenerator {
     
     func generate() async -> [[Int]] {
         generatedPatterns = []
-        
-        // 選択された数字を配列に変換
+        await patternStore.clear()
+        await patternStore.setMaxCount(requestedPatternCount)
         let numbers = Array(selectedNumbers).sorted()
         
-        // 最適化されたアプローチ：
-        // 1. 少数のパターンが必要な場合は効率的なランダム生成を使用
-        // 2. より多くのパターンが必要な場合は早期枝刈りを伴うバックトラッキングを使用
         if requestedPatternCount <= 10 && numbers.count >= 10 {
-            // 効率的なランダム生成を使用
-            await generateRandomPatterns(from: numbers)
+            // タスク数をCPUコア数に最適化
+            let tasksCount = cpuCount
+            let patternsPerTask = max(requestedPatternCount / tasksCount + 1, 3)
+            await withTaskGroup(of: [[Int]].self) { group in
+                for _ in 0..<tasksCount {
+                    group.addTask {
+                        await self.generateRandomPatternsTask(from: numbers, count: patternsPerTask)
+                    }
+                }
+                for await patterns in group {
+                    for pattern in patterns {
+                        let sortedPattern = pattern.sorted()
+                        await self.patternStore.appendIfUnique(sortedPattern, minUniqueDigits: self.conditions.minUniqueDigits)
+                        if await self.patternStore.count >= self.requestedPatternCount {
+                            return
+                        }
+                    }
+                }
+            }
+            generatedPatterns = await patternStore.patterns
         } else {
-            // 早期枝刈りを伴う最適化されたバックトラッキングを使用
-            await generateWithOptimizedBacktracking(numbers: numbers, currentCombination: [], startIndex: 0, currentMask: 0)
+            // バックトラッキングの並列化を2段階目まで拡張
+            await generateWithOptimizedBacktrackingParallel(numbers: numbers)
+            generatedPatterns = await patternStore.patterns
         }
-        
         return generatedPatterns
     }
     
-    // ランダム生成アプローチ
+    // 単一のタスクでランダムパターンを生成
+    private func generateRandomPatternsTask(from numbers: [Int], count: Int) async -> [[Int]] {
+        var localPatterns: [[Int]] = []
+        let maxAttempts = max(count * 20, 200)
+        var attempts = 0
+        
+        // 特定の数字グループからのインデックス範囲を計算
+        let lowRangeIndices = numbers.indices.filter { numbers[$0] <= 21 }
+        let highRangeIndices = numbers.indices.filter { numbers[$0] > 21 && numbers[$0] < 40 }
+        let over40Indices = numbers.indices.filter { numbers[$0] >= 40 }
+        
+        // ローカルのランダムジェネレーター
+        var localRandom = CustomRandomGenerator()
+        
+        while localPatterns.count < count && attempts < maxAttempts {
+            attempts += 1
+            let currentCount = await patternStore.count
+            let maxCount = await patternStore.maxCount
+            if currentCount >= maxCount { break }
+            
+            // 条件に基づいて選択する数字を決定
+            var selectedIndices = Set<Int>()
+            var combination: [Int] = []
+            
+            // 1. 低範囲の数字 (1-21)
+            let targetLowCount = conditions.lowRangeCount >= 0 ? conditions.lowRangeCount : Int.random(in: 0...min(6, lowRangeIndices.count), using: &localRandom)
+            if !lowRangeIndices.isEmpty && targetLowCount > 0 {
+                for _ in 0..<targetLowCount {
+                    if let randomIndex = lowRangeIndices.randomElement(using: &localRandom) {
+                        if !selectedIndices.contains(randomIndex) {
+                            selectedIndices.insert(randomIndex)
+                            combination.append(numbers[randomIndex])
+                        }
+                    }
+                }
+            }
+            
+            // 2. 40以上の数字
+            let maxOver40Count = conditions.over40Count >= 0 ? 
+                min(conditions.over40Count, 6 - combination.count) : 
+                min(min(2, over40Indices.count), 6 - combination.count)
+
+            // 上限として機能するよう0〜maxOver40Countの範囲からランダムに選択
+            let targetOver40Count = conditions.over40Count >= 0 ?
+                Int.random(in: 0...maxOver40Count, using: &localRandom) : // 0から上限値までのランダムに変更
+                Int.random(in: 0...min(min(2, over40Indices.count), 6 - combination.count), using: &localRandom)
+
+            if !over40Indices.isEmpty && targetOver40Count > 0 {
+                for _ in 0..<targetOver40Count {
+                    if let randomIndex = over40Indices.randomElement(using: &localRandom) {
+                        if !selectedIndices.contains(randomIndex) {
+                            selectedIndices.insert(randomIndex)
+                            combination.append(numbers[randomIndex])
+                        }
+                    }
+                }
+            }
+            
+            // 3. 残りの数字を22-39から選択
+            let remainingCount = 6 - combination.count
+            if remainingCount > 0 && !highRangeIndices.isEmpty {
+                for _ in 0..<remainingCount {
+                    if let randomIndex = highRangeIndices.randomElement(using: &localRandom) {
+                        if !selectedIndices.contains(randomIndex) {
+                            selectedIndices.insert(randomIndex)
+                            combination.append(numbers[randomIndex])
+                        }
+                    }
+                }
+            }
+            
+            // 4. まだ6個に満たない場合は、残りの利用可能な数字から選択
+            while combination.count < 6 {
+                let remainingIndices = numbers.indices.filter { !selectedIndices.contains($0) }
+                if remainingIndices.isEmpty {
+                    break
+                }
+                if let randomIndex = remainingIndices.randomElement(using: &localRandom) {
+                    selectedIndices.insert(randomIndex)
+                    combination.append(numbers[randomIndex])
+                }
+            }
+            
+            // 組み合わせが6個で構成されているか確認
+            if combination.count == 6 {
+                let isValid = isValidCombinationLocal(combination)
+                if isValid {
+                    // 生成されたパターンが他のものと十分に異なるか確認
+                    let isUnique = isUniqueCombinationLocal(combination, patterns: localPatterns)
+                    if isUnique {
+                        localPatterns.append(combination)
+                    }
+                }
+            }
+        }
+        
+        return localPatterns
+    }
+    
+    // ランダム生成アプローチ（メインスレッド用）
     private func generateRandomPatterns(from numbers: [Int]) async {
         // 最大試行回数
         let maxAttempts = max(requestedPatternCount * 20, 1000)
@@ -121,7 +240,7 @@ actor PatternGenerator {
                     // パターン間の共通数字数チェック
                     let isUnique = await isUniqueCombination(combination)
                     if isUnique {
-                        generatedPatterns.append(combination)
+                        generatedPatterns.append(combination.sorted())
                     }
                 }
             }
@@ -130,8 +249,9 @@ actor PatternGenerator {
     
     // 最適化されたバックトラッキング
     private func generateWithOptimizedBacktracking(numbers: [Int], currentCombination: [Int], startIndex: Int, currentMask: UInt64) async {
-        // 要求されたパターン数に達したら終了
-        if generatedPatterns.count >= requestedPatternCount {
+        let currentCount = await patternStore.count
+        let maxCount = await patternStore.maxCount
+        if currentCount >= maxCount {
             return
         }
         
@@ -142,7 +262,12 @@ actor PatternGenerator {
             if isValid {
                 let isUnique = await isUniqueCombination(currentCombination)
                 if isUnique {
-                    generatedPatterns.append(currentCombination)
+                    await patternStore.appendIfUnique(currentCombination, minUniqueDigits: conditions.minUniqueDigits)
+                    let newCount = await patternStore.count
+                    let maxCount = await patternStore.maxCount
+                    if newCount >= maxCount {
+                        return
+                    }
                 }
             }
             return
@@ -153,19 +278,47 @@ actor PatternGenerator {
             return
         }
         
-        // バックトラッキングによる組み合わせ生成
-        for i in startIndex..<numbers.count {
-            let number = numbers[i]
-            let newMask = currentMask | (UInt64(1) << number)
-            var newCombination = currentCombination
-            newCombination.append(number)
-            
-            await generateWithOptimizedBacktracking(
-                numbers: numbers,
-                currentCombination: newCombination,
-                startIndex: i + 1,
-                currentMask: newMask
-            )
+        // 並列処理が可能な条件: 最初の数字を選ぶときのみ並列化
+        if currentCombination.isEmpty && numbers.count > 20 {
+            // 最初の枝分かれのみ並列処理
+            await withTaskGroup(of: Void.self) { group in
+                // 選択する数字の範囲を分割
+                let chunkSize = max(1, numbers.count / 8)
+                
+                for chunkStart in stride(from: startIndex, to: numbers.count, by: chunkSize) {
+                    let chunkEnd = min(chunkStart + chunkSize, numbers.count)
+                    
+                    group.addTask {
+                        for i in chunkStart..<chunkEnd {
+                            let number = numbers[i]
+                            let newMask = currentMask | (UInt64(1) << number)
+                            var newCombination = currentCombination
+                            newCombination.append(number)
+                            
+                            await self.generateWithOptimizedBacktracking(
+                                numbers: numbers,
+                                currentCombination: newCombination,
+                                startIndex: i + 1,
+                                currentMask: newMask
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            // 通常のバックトラッキング
+            for i in startIndex..<numbers.count {
+                let number = numbers[i]
+                let newMask = currentMask | (UInt64(1) << number)
+                let comb1 = [number]
+                
+                await generateWithOptimizedBacktracking(
+                    numbers: numbers,
+                    currentCombination: comb1,
+                    startIndex: i + 1,
+                    currentMask: newMask
+                )
+            }
         }
     }
     
@@ -220,16 +373,86 @@ actor PatternGenerator {
     
     // 生成されたパターンとの比較
     private func isUniqueCombination(_ combination: [Int]) async -> Bool {
+        // 完全一致（順不同）重複チェック
+        let normalizedCombination = combination.sorted()
+        for pattern in generatedPatterns {
+            if pattern.sorted() == normalizedCombination {
+                return false
+            }
+        }
+        // パターン間共通数字数チェック
         if conditions.minUniqueDigits >= 0 {
             let combinationSet = Set(combination)
             for pattern in generatedPatterns {
                 let patternSet = Set(pattern)
-                let intersection = combinationSet.intersection(patternSet)
-                if intersection.count > conditions.minUniqueDigits {
+                let commonCount = combinationSet.intersection(patternSet).count
+                // minUniqueDigitsはユニークな数字の最小数なので、共通数字の最大数は6 - minUniqueDigits
+                if commonCount > (6 - conditions.minUniqueDigits) {
                     return false
                 }
             }
         }
+        return true
+    }
+    
+    // 並列処理用のローカル版：パターン共通数字チェック
+    private func isUniqueCombinationLocal(_ combination: [Int], patterns: [[Int]]) -> Bool {
+        // 完全一致（順不同）重複チェック
+        let normalizedCombination = combination.sorted()
+        for pattern in patterns {
+            if pattern.sorted() == normalizedCombination {
+                return false
+            }
+        }
+        // パターン間共通数字数チェック
+        if conditions.minUniqueDigits >= 0 {
+            let combinationSet = Set(combination)
+            for pattern in patterns {
+                let patternSet = Set(pattern)
+                let intersection = combinationSet.intersection(patternSet)
+                if intersection.count > (6 - conditions.minUniqueDigits) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+    
+    // 並列処理用のローカル版：パターン条件チェック
+    private func isValidCombinationLocal(_ combination: [Int]) -> Bool {
+        // 基本的な条件チェック
+        let over40Numbers = combination.filter { $0 >= 40 }
+        // 40以上の数字は上限値以下であればOK（完全に一致する必要はない）
+        if conditions.over40Count >= 0 && over40Numbers.count > conditions.over40Count {
+            return false
+        }
+        
+        let lowRangeNumbers = combination.filter { $0 <= 21 }
+        if conditions.lowRangeCount >= 0 && lowRangeNumbers.count != conditions.lowRangeCount {
+            return false
+        }
+        
+        let oddNumbers = combination.filter { $0 % 2 == 1 }
+        if conditions.oddCount >= 0 && oddNumbers.count != conditions.oddCount {
+            return false
+        }
+        
+        // 連続するペアチェック
+        if conditions.consecutivePairCount >= 0 {
+            var pairCount = 0
+            let sortedNumbers = combination.sorted()
+            
+            for i in 0..<sortedNumbers.count - 1 {
+                if sortedNumbers[i] < 40 && sortedNumbers[i+1] < 40 && sortedNumbers[i+1] - sortedNumbers[i] == 1 {
+                    pairCount += 1
+                }
+            }
+            
+            if pairCount != conditions.consecutivePairCount {
+                return false
+            }
+        }
+        
         return true
     }
     
@@ -252,10 +475,18 @@ actor PatternGenerator {
             return false
         }
         
-        // 連続ペアのチェック
+        // 連続するペアチェック
         if conditions.consecutivePairCount >= 0 {
-            let consecutivePairs = countConsecutivePairs(in: combination)
-            if consecutivePairs != conditions.consecutivePairCount {
+            var pairCount = 0
+            let sortedNumbers = combination.sorted()
+            
+            for i in 0..<sortedNumbers.count - 1 {
+                if sortedNumbers[i] < 40 && sortedNumbers[i+1] < 40 && sortedNumbers[i+1] - sortedNumbers[i] == 1 {
+                    pairCount += 1
+                }
+            }
+            
+            if pairCount != conditions.consecutivePairCount {
                 return false
             }
         }
@@ -263,27 +494,67 @@ actor PatternGenerator {
         return true
     }
     
-    private func countConsecutivePairs(in numbers: [Int]) -> Int {
-        let sortedNumbers = numbers.sorted()
-        var pairCount = 0
-        
-        for i in 0..<sortedNumbers.count-1 {
-            if sortedNumbers[i] < 40 && sortedNumbers[i+1] < 40 && sortedNumbers[i+1] - sortedNumbers[i] == 1 {
-                pairCount += 1
+    // バックトラッキングの並列化を2段階目まで拡張
+    private func generateWithOptimizedBacktrackingParallel(numbers: [Int]) async {
+        await withTaskGroup(of: Void.self) { group in
+            for i in 0..<numbers.count {
+                let number1 = numbers[i]
+                let mask1 = UInt64(1) << number1
+                let comb1 = [number1]
+                // 2段階目まで並列化
+                for j in (i+1)..<numbers.count {
+                    let number2 = numbers[j]
+                    let mask2 = mask1 | (UInt64(1) << number2)
+                    var comb2 = comb1
+                    comb2.append(number2)
+                    group.addTask {
+                        await self.generateWithOptimizedBacktracking(
+                            numbers: numbers,
+                            currentCombination: comb2,
+                            startIndex: j + 1,
+                            currentMask: mask2
+                        )
+                    }
+                }
             }
         }
-        
-        return pairCount
     }
 }
 
-// カスタムランダム数生成器
-private struct CustomRandomGenerator: RandomNumberGenerator {
-    private var source = SystemRandomNumberGenerator()
+// カスタムランダム生成器
+struct CustomRandomGenerator: RandomNumberGenerator {
+    private var seed: UInt64
     
-    init() {}
+    init(seed: UInt64 = UInt64(Date().timeIntervalSince1970 * 1000)) {
+        self.seed = seed &* 6364136223846793005 &+ 1
+    }
     
     mutating func next() -> UInt64 {
-        source.next()
+        seed = seed &* 6364136223846793005 &+ 1
+        return seed
     }
-} 
+}
+
+// 生成済みパターンのスレッドセーフ管理用actor
+actor PatternStore {
+    private(set) var patterns: [[Int]] = []
+    private(set) var maxCount: Int = Int.max
+    func setMaxCount(_ count: Int) { self.maxCount = count }
+    func appendIfUnique(_ pattern: [Int], minUniqueDigits: Int) {
+        if patterns.count >= maxCount { return }
+        // 完全一致重複チェック
+        if patterns.contains(where: { $0 == pattern }) { return }
+        // パターン間共通数字数チェック
+        if minUniqueDigits >= 0 {
+            let patternSet = Set(pattern)
+            for p in patterns {
+                let pSet = Set(p)
+                let commonCount = patternSet.intersection(pSet).count
+                if commonCount > (6 - minUniqueDigits) { return }
+            }
+        }
+        patterns.append(pattern)
+    }
+    func clear() { patterns.removeAll() }
+    var count: Int { patterns.count }
+}

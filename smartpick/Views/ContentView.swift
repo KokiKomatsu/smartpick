@@ -1,4 +1,5 @@
 import SwiftUI
+import SwiftData
 
 struct ContentView: View {
     @State private var selectedNumbers: Set<Int> = []
@@ -7,18 +8,13 @@ struct ContentView: View {
     @State private var generatedPatterns: [[Int]] = []
     @State private var isGenerating = false
     @State private var showingConditionSettings = false
-    @State private var showingHelp = false
     @State private var alert: AlertType?
     @Environment(\.colorScheme) private var colorScheme
-    
+    @Environment(\.modelContext) private var modelContext
+
     private let patternCountOptions = [1, 3, 5, 10]
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 7)
-    
-    // アクセントカラー
-    private var accentColor: Color {
-        Color.blue
-    }
-    
+
     // テキストカラー
     private var primaryTextColor: Color {
         colorScheme == .dark ? Color.white : Color.black
@@ -28,12 +24,7 @@ struct ContentView: View {
     private var backgroundColor: Color {
         colorScheme == .dark ? Color(.systemGray6) : Color(.systemGray6)
     }
-    
-    // 選択背景カラー
-    private var selectionColor: Color {
-        colorScheme == .dark ? Color.blue.opacity(0.8) : Color.blue
-    }
-    
+
     var body: some View {
         NavigationView {
             ScrollView {
@@ -42,8 +33,8 @@ struct ContentView: View {
                     Text("SmartPick")
                         .font(.system(size: 36, weight: .bold))
                         .padding(.vertical, 16)
-                        .foregroundColor(accentColor)
-                    
+                        .foregroundStyle(Color.accentGradient) // 共通定義を使用
+
                     // 数字選択セクション
                     VStack(spacing: 12) {
                         HStack {
@@ -63,9 +54,9 @@ struct ContentView: View {
                                         Text("全選択")
                                     }
                                     .font(.system(size: 14, weight: .medium))
-                                    .foregroundColor(accentColor)
+                                    .foregroundStyle(Color.accentGradient) // 共通定義を使用
                                 }
-                                
+
                                 Button(action: {
                                     selectedNumbers.removeAll()
                                 }) {
@@ -95,7 +86,7 @@ struct ContentView: View {
                                             }
                                         }
                                     ),
-                                    selectionColor: selectionColor,
+                                    selectionGradient: Color.accentGradient, // 条件設定画面と統一
                                     backgroundColor: backgroundColor
                                 )
                             }
@@ -118,10 +109,15 @@ struct ContentView: View {
                                         .font(.system(size: 18, weight: .medium))
                                         .frame(maxWidth: .infinity)
                                         .padding(.vertical, 12)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 10)
-                                                .fill(requestedPatternCount == count ? selectionColor : backgroundColor)
-                                        )
+                                        .background { // backgroundクロージャを使用
+                                            if requestedPatternCount == count {
+                                                RoundedRectangle(cornerRadius: 10)
+                                                    .fill(Color.accentGradient) // 条件設定画面と統一
+                                            } else {
+                                                RoundedRectangle(cornerRadius: 10)
+                                                    .fill(backgroundColor)
+                                            }
+                                        }
                                         .foregroundColor(requestedPatternCount == count ? .white : primaryTextColor)
                                 }
                             }
@@ -145,9 +141,9 @@ struct ContentView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 16)
-                        .background(
+                        .background( // backgroundクロージャを使用
                             RoundedRectangle(cornerRadius: 12)
-                                .fill(accentColor)
+                                .fill(Color.accentGradient) // 共通定義を使用
                         )
                         .foregroundColor(.white)
                     }
@@ -169,17 +165,20 @@ struct ContentView: View {
                                             .font(.system(size: 16, weight: .medium))
                                             .foregroundColor(.secondary)
                                         Spacer()
-                                        HStack(spacing: 8) {
-                                            ForEach(generatedPatterns[index].sorted(), id: \.self) { number in
-                                                Text("\(number)")
-                                                    .font(.system(size: 18, weight: .medium))
-                                                    .frame(width: 36, height: 36)
-                                                    .background(
-                                                        RoundedRectangle(cornerRadius: 8)
-                                                            .fill(backgroundColor)
-                                                    )
-                                                    .foregroundColor(primaryTextColor)
-                                            }
+                                    }
+                                    .padding(.horizontal)
+                                    
+                                    // ここで数字を表示
+                                    HStack(spacing: 8) {
+                                        ForEach(generatedPatterns[index], id: \.self) { number in
+                                            Text("\(number)")
+                                                .font(.system(size: 18, weight: .medium))
+                                                .frame(width: 36, height: 36)
+                                                .background(
+                                                    RoundedRectangle(cornerRadius: 8)
+                                                        .fill(Color.accentGradient) // 条件設定画面と統一
+                                                )
+                                                .foregroundColor(.white)
                                         }
                                     }
                                     .padding(.horizontal)
@@ -198,31 +197,19 @@ struct ContentView: View {
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button(action: {
-                        showingHelp = true
-                    }) {
-                        Image(systemName: "questionmark.circle")
-                            .font(.system(size: 20))
-                            .foregroundColor(accentColor)
-                    }
-                }
-                
-                ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    // 条件設定ボタン（右端）
                     Button(action: {
                         showingConditionSettings = true
                     }) {
                         Image(systemName: "slider.horizontal.3")
                             .font(.system(size: 20))
-                            .foregroundColor(accentColor)
+                            .foregroundStyle(Color.accentGradient) // 共通定義を使用
                     }
                 }
             }
             .sheet(isPresented: $showingConditionSettings) {
                 ConditionSettingsView(conditions: $conditions)
-            }
-            .sheet(isPresented: $showingHelp) {
-                HelpView()
             }
             .customAlert(alert: $alert)
         }
@@ -294,4 +281,4 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
-} 
+}

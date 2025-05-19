@@ -10,24 +10,41 @@ import SwiftData
 
 @main
 struct smartpickApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-
+    // モデルコンテナを保持するプロパティ
+    let modelContainer: ModelContainer
+    
+    // 初期化時にモデルコンテナを作成
+    init() {
+        print("アプリ初期化を開始")
+        // FavoritePattern関連のスキーマ・マネージャーを削除
+        // 必要に応じて他のモデルをここに追加してください
+        let schema = Schema([])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
         do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
+            modelContainer = try ModelContainer(for: schema, configurations: [config])
+            print("ModelContainerを正常に作成")
         } catch {
-            fatalError("Could not create ModelContainer: \(error)")
+            print("ModelContainer作成に失敗: \(error)")
+            let fallbackConfig = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+            do {
+                modelContainer = try ModelContainer(for: schema, configurations: [fallbackConfig])
+                print("メモリ内ModelContainerを作成")
+            } catch {
+                fatalError("モデルコンテナの作成に完全に失敗: \(error)")
+            }
         }
-    }()
-
+    }
+    
     var body: some Scene {
         WindowGroup {
+            // TabViewからFavoritesViewを削除
             ContentView()
+                .tabItem {
+                    Label("パターン生成", systemImage: "dice")
+                }
         }
-        .modelContainer(sharedModelContainer)
+        .modelContainer(modelContainer)
     }
 }
+
 
